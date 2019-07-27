@@ -509,7 +509,10 @@ static void dbus_write(struct target *target, uint16_t address, uint64_t value)
 	}
 	if (status != DBUS_STATUS_SUCCESS)
 		LOG_ERROR("failed to write 0x%" PRIx64 " to 0x%x; status=%d\n", value, address, status);
+
 }
+
+static void riscv011_set_hart_field_in_dmcontrol(struct target *target, int hart);
 
 /*** scans "class" ***/
 
@@ -675,7 +678,7 @@ static void dram_write32(struct target *target, unsigned int index, uint32_t val
 }
 
 /** Read the haltnot and interrupt bits. */
-static bits_t read_bits(struct target *target)
+static bits_t read_bits(struct target *target, int hart)
 {
 	uint64_t value;
 	dbus_status_t status;
@@ -687,46 +690,75 @@ static bits_t read_bits(struct target *target)
 		.interrupt = 0
 	};
 
-	do {
-		unsigned i = 0;
-		do {
-			status = dbus_scan(target, &address_in, &value, DBUS_OP_READ, 0, 0);
-			if (status == DBUS_STATUS_BUSY) {
-				LOG_INFO("XXXXXXXXX DBUG_STATUS_BUSY XXXXXXXXXXXXX");
-				if (address_in == (1<<info->addrbits) - 1 &&
-						value == (1ULL<<DBUS_DATA_SIZE) - 1) {
-					LOG_ERROR("TDO seems to be stuck high.");
-					return err_result;
-				}
-				increase_dbus_busy_delay(target);
-			}
-		} while (status == DBUS_STATUS_BUSY && i++ < 256);
+	int skip = 5;
+	int hartToRestore = -1;
 
-		if (i >= 256) {
-			LOG_ERROR("Failed to read from 0x%x; status=%d", address_in, status);
-			return err_result;
-		}
-	} while (address_in > 0x10 && address_in != DMCONTROL);
+	for (int pass = 0;; pass++)
+	{
+		do
+		{
+			unsigned i = 0;
+			do
+			{
+				status = dbus_scan(target, &address_in, &value, DBUS_OP_READ, DMCONTROL, 0);
+				if (status == DBUS_STATUS_BUSY)
+				{
+					LOG_INFO("XXXXXXXXX DBUG_STATUS_BUSY XXXXXXXXXXXXX");
+					if (address_in == (1 << info->addrbits) - 1 &&
+						value == (1ULL << DBUS_DATA_SIZE) - 1)
+					{
+						LOG_ERROR("TDO seems to be stuck high.");
+						return err_result;
+					}
+					increase_dbus_busy_delay(target);
+				}
+			} while (status == DBUS_STATUS_BUSY && i++ < 256);
+
+			if (i >= 256)
+			{
+				LOG_ERROR("Failed to read from 0x%x; status=%d", address_in, status);
+				return err_result;
+			}
+		} while (address_in != DMCONTROL && skip-- > 0);
+
+		int reportedHart = get_field(value, DMCONTROL_HARTID);
+		if (reportedHart == hart)
+			break;
+
+		riscv011_set_hart_field_in_dmcontrol(target, hart);
+		hartToRestore = reportedHart;
+	}
+	
+	if (hartToRestore != -1)
+		riscv011_set_hart_field_in_dmcontrol(target, hartToRestore);
 
 	bits_t result = {
 		.haltnot = get_field(value, DMCONTROL_HALTNOT),
 		.interrupt = get_field(value, DMCONTROL_INTERRUPT)
 	};
+
+	if (result.haltnot)
+	{
+		asm("nop");
+	}
+	
 	return result;
 }
 
 static int wait_for_debugint_clear(struct target *target, bool ignore_first)
 {
+	RISCV_INFO(r);
+
 	time_t start = time(NULL);
 	if (ignore_first) {
 		/* Throw away the results of the first read, since they'll contain the
 		 * result of the read that happened just before debugint was set.
 		 * (Assuming the last scan before calling this function was one that
 		 * sets debugint.) */
-		read_bits(target);
+		read_bits(target, r->current_hartid);
 	}
 	while (1) {
-		bits_t bits = read_bits(target);
+		bits_t bits = read_bits(target, r->current_hartid);
 		if (!bits.interrupt)
 			return ERROR_OK;
 		if (time(NULL) - start > riscv_command_timeout_sec) {
@@ -816,6 +848,9 @@ static int cache_write(struct target *target, unsigned int address, bool run)
 		if (info->dram_cache[i].dirty)
 			last = i;
 	}
+
+	if (last == info->dramsize)
+		last = info->dramsize - 1;	//The dmcontrol code below looks bugged, so we avoid it by doing a memory write even if it's not strictly required.
 
 	RISCV_INFO(r);
 	if (last == info->dramsize) {
@@ -1287,12 +1322,27 @@ static int is_wfi(struct target *target, int hartid)
 // ----------------------------------------------------------------------------
 // select_hart
 
+static void riscv011_set_hart_field_in_dmcontrol(struct target *target, int hart)
+{
+	RISCV_INFO(r);
+	uint64_t dmcontrol = DMCONTROL_HALTNOT | DMCONTROL_BUSERROR;	//Writing 0 to those fields would clear the corresponding flags and we don't want to do it implicitly.
+	dmcontrol = set_field(dmcontrol, DMCONTROL_HARTID, hart);
+	dmcontrol = set_field(dmcontrol, DMCONTROL_ACCESS, 2);	//32-bit access, default for Kendryte devices
+	
+	dbus_write(target, DMCONTROL, dmcontrol);
+
+	dbus_read(target, DMCONTROL); //Previous value
+	dmcontrol = dbus_read(target, DMCONTROL);
+	if (get_field(dmcontrol, DMCONTROL_HARTID) != hart)
+	{
+		LOG_ERROR("Unexpected HART read back from DMCONTROL: %d instead of %d\r\n", get_field(dmcontrol, DMCONTROL_HARTID), hart);
+	}
+}
+
 static void riscv011_select_current_hart(struct target *target)
 {
 	RISCV_INFO(r);
-	uint64_t dmcontrol = dbus_read(target, DMCONTROL);
-	dmcontrol = set_field(dmcontrol, DMCONTROL_HARTID, r->current_hartid);
-	dbus_write(target, DMCONTROL, dmcontrol);
+	riscv011_set_hart_field_in_dmcontrol(target, r->current_hartid);
 }
 
 static void riscv011_select_hart(struct target* target, int hartid)
@@ -1301,9 +1351,7 @@ static void riscv011_select_hart(struct target* target, int hartid)
 	if (r->current_hartid != hartid)
 	{
 		r->current_hartid = hartid;
-		uint64_t dmcontrol = dbus_read(target, DMCONTROL);
-		dmcontrol = set_field(dmcontrol, DMCONTROL_HARTID, r->current_hartid);
-		dbus_write(target, DMCONTROL, dmcontrol);
+		riscv011_set_hart_field_in_dmcontrol(target, hartid);
 	}
 }
 
@@ -1340,7 +1388,9 @@ static int riscv011_halt(struct target* target)
 {
 	KENDRYTE_LOG_FC();
 	test(target);
-	int another_hart = 1 - debug_info.debug_hartid;
+	RISCV_INFO(r);
+	int hart = r->current_hartid;
+	int another_hart = 1 - hart;
 
     if (!is_wfi(target, another_hart))
     {
@@ -1353,12 +1403,12 @@ static int riscv011_halt(struct target* target)
         handle_halt(target, true);
     }
 
-    if (!is_wfi(target, debug_info.debug_hartid))
+    if (!is_wfi(target, hart))
     {
-        riscv011_select_hart(target, debug_info.debug_hartid);
+        riscv011_select_hart(target, hart);
         if (riscv011_halt_current_hart(target) != ERROR_OK)
         {
-            LOG_ERROR("hart %d halt failed.", debug_info.debug_hartid);
+            LOG_ERROR("hart %d halt failed.", hart);
             return ERROR_FAIL;
         }
         handle_halt(target, true);
@@ -1383,6 +1433,16 @@ static int risc011_resume_current_hart(struct target *target, bool step)
 	riscv011_info_t *info = get_info(target);
 
     KENDRYTE_LOG_D("resume current hartid = %d", r->current_hartid);
+
+	uint64_t dmcontrol = dbus_read(target, DMCONTROL);
+	if (get_field(dmcontrol, DMCONTROL_HARTID) != r->current_hartid)
+	{
+		riscv011_set_hart_field_in_dmcontrol(target, r->current_hartid);
+		dmcontrol = dbus_read(target, DMCONTROL);
+		dmcontrol = dbus_read(target, DMCONTROL);
+	}
+
+	dbus_write(target, DMCONTROL, dmcontrol & ~DMCONTROL_HALTNOT);	//Clear the HALTNOT flag
 
 	LOG_DEBUG("step=%d", step);
 
@@ -1444,7 +1504,9 @@ static int risc011_resume_current_hart(struct target *target, bool step)
 
 static int riscv011_resume_all_hart(struct target* target, bool step)
 {
-	int another_hart = 1 - debug_info.debug_hartid;
+	RISCV_INFO(r);
+	int hart = r->current_hartid;
+	int another_hart = 1 - hart;
 
 	if (!is_wfi(target, another_hart) && !riscv011_is_hart_running(target, another_hart))
 	{
@@ -1456,12 +1518,12 @@ static int riscv011_resume_all_hart(struct target* target, bool step)
 		}
 	}
 
-	if (!is_wfi(target, debug_info.debug_hartid) && !riscv011_is_hart_running(target, debug_info.debug_hartid))
+	if (!is_wfi(target, hart) && !riscv011_is_hart_running(target, hart))
 	{
-        riscv011_select_hart(target, debug_info.debug_hartid);
+        riscv011_select_hart(target, hart);
 		if (risc011_resume_current_hart(target, step) != ERROR_OK)
 		{
-			KENDRYTE_LOG_I("hart %d resume failed.", debug_info.debug_hartid);
+			KENDRYTE_LOG_I("hart %d resume failed.", hart);
 			return ERROR_FAIL;
 		}
 	}
@@ -1777,6 +1839,10 @@ static riscv_error_t handle_halt_routine(struct target *target)
 {
 	KENDRYTE_LOG_FC();
 	riscv011_info_t *info = get_info(target);
+	RISCV_INFO(r);
+
+	jtag_add_ir_scan(target->tap, &select_dbus, TAP_IDLE);
+	riscv011_set_hart_field_in_dmcontrol(target, r->current_hartid);
 
 	scans_t *scans = scans_new(target, 256);
 
@@ -2078,7 +2144,20 @@ static int poll_target(struct target *target, bool announce)
 	if (debug_level >= LOG_LVL_DEBUG)
 		debug_level = LOG_LVL_INFO;
 
-	bits_t bits = read_bits(target);
+	bits_t allBits[2];
+	allBits[0] = read_bits(target, 0);
+	allBits[1] = read_bits(target, 1);
+
+	if (!allBits[r->current_hartid].haltnot)
+	{
+		if (allBits[0].haltnot)
+			riscv_set_current_hartid(target , 0);
+		else if (allBits[1].haltnot)
+			riscv_set_current_hartid(target, 1);
+	}
+
+	bits_t bits = allBits[r->current_hartid];
+
 	debug_level = old_debug_level;
 
     //LOG_INFO("hart [%d] state: %d", r->current_hartid, info->state[r->current_hartid]);
