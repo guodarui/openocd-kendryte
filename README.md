@@ -1,20 +1,17 @@
-Kendryte OpenOCD
+Kendryte OpenOCD with Sysprogs Fixes
 =======
 
-The **Kendryte OpenOCD** forks from [riscv-openocd](https://github.com/riscv/riscv-openocd), improved for Kendryte K210.
+This is a fork of the Kendryte version of OpenOCD supporting the Kendryte K210 chip.
 
-## Kendryte Support
+The original Kendryte OpenOCD requires selecting one of the 2 chip cores prior to debugging it with OpenOCD. Furthermore, breakpoints triggered on the core that is not explicitly debugged would crash the debug session instead of having it stopped in OpenOCD.
 
-* Stronger stability and better debugging experience
-* Support for multi-core debugging
-* Not guaranteed to be compatible with other chips
+Sysprogs has fixed it by modifying the polling logic to check the status of both cores (HARTs in RISC-V terms) and automatically switching to debugging the core (HART) that triggered last breakpoint.
+However, this still leads to occasional crashes, as OpenOCD appears to mix the contexts (registers?) from different HARTs.
 
-## Prebuild
+In order to fully resolve this and get reliable debugging behavior, the following design changes will need to be applied:
 
-Prebuild can be downloaded at [github releases](https://github.com/kendryte/openocd-kendryte/releases).
+* The semantics of the "Current HART" field should change from "HART selected for current operation" to "HART that has its state (e.g. registers) reported to OpenOCD as the current target's state". It should only be changed when the target is changing from 'running' to 'stopped'.
+* All register reading/writing and other state manipulation functions should EXPLICITLY take the HART ID as a parameter and should *NOT* change the 'current HART' value.
+* Extra care needs to be taken when accessing the DMCONTROL register to *NOT* accidentally change the HARTID field there and to *NOT* accidentally clear HALTNOT flag or other flags.
 
-Also you can get them on Kendryte website: https://kendryte.com
-
-## Document
-
-[Wiki](https://github.com/kendryte/openocd-kendryte/wiki)
+Ideally, the riscv-011.c should be redesigned similar to riscv-013.c to support the "risc_v" RTOS that exposes each HART as a separate thread to GDB.
