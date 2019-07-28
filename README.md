@@ -15,3 +15,6 @@ In order to fully resolve this and get reliable debugging behavior, the followin
 * Extra care needs to be taken when accessing the DMCONTROL register to *NOT* accidentally change the HARTID field there and to *NOT* accidentally clear HALTNOT flag or other flags.
 
 Ideally, the riscv-011.c should be redesigned similar to riscv-013.c to support the "risc_v" RTOS that exposes each HART as a separate thread to GDB.
+
+
+P.S. A very good overview of RISC-V debug logic can be found here: https://sifive.cdn.prismic.io/sifive%2F645ebcda-d46b-47e4-80fc-29fe673dcc68_riscv-debug-spec-0.11nov12.pdf
